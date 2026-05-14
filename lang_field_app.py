@@ -8,14 +8,23 @@
 from __future__ import annotations
 
 import io
+import random
 import re
 import time
+from collections.abc import Callable
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
+from langdetect import DetectorFactory, LangDetectException, detect
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import streamlit as st
+
+# langdetect 비결정적 출력 완화(짧은 텍스트는 여전히 불안정할 수 있음)
+DetectorFactory.seed = 0
 
 # ---------------------------------------------------------------------------
 # 상수: API 기본 설정 (엔드포인트만 바꿔서 스테이징/미러 등으로 교체 가능)
@@ -200,6 +209,207 @@ def resolve_image_url(raw: dict[str, Any]) -> str | None:
         if v:
             return v
     return None
+
+
+# ---------------------------------------------------------------------------
+# 언어: API 필드 스캔 + 원제 기반(langdetect) 보조
+# ---------------------------------------------------------------------------
+
+# ISO 639-1 위주 + 흔한 3자 코드 일부 (langdetect는 주로 2자 반환)
+LANG_CODE_TO_KO: dict[str, str] = {
+    "en": "영어",
+    "ko": "한국어",
+    "ja": "일본어",
+    "zh": "중국어",
+    "zh-cn": "중국어(간체)",
+    "zh-tw": "중국어(번체)",
+    "fr": "프랑스어",
+    "de": "독일어",
+    "es": "스페인어",
+    "it": "이탈리아어",
+    "pt": "포르투갈어",
+    "ru": "러시아어",
+    "ar": "아랍어",
+    "hi": "힌디어",
+    "th": "태국어",
+    "vi": "베트남어",
+    "id": "인도네시아어",
+    "tr": "터키어",
+    "pl": "폴란드어",
+    "nl": "네덜란드어",
+    "sv": "스웨덴어",
+    "no": "노르웨이어",
+    "da": "덴마크어",
+    "fi": "핀란드어",
+    "cs": "체코어",
+    "hu": "헝가리어",
+    "ro": "루마니아어",
+    "uk": "우크라이나어",
+    "el": "그리스어",
+    "he": "히브리어",
+    "fa": "페르시아어",
+    "bn": "벵골어",
+    "ta": "타밀어",
+    "ms": "말레이어",
+    "tl": "타갈로그어",
+    "sw": "스와힐리어",
+    "bg": "불가리아어",
+    "sk": "슬로바키아어",
+    "sl": "슬로베니아어",
+    "hr": "크로아티아어",
+    "sr": "세르비아어",
+    "et": "에스토니아어",
+    "lv": "라트비아어",
+    "lt": "리투아니아어",
+    "sq": "알바니아어",
+    "mk": "마케도니아어",
+    "is": "아이슬란드어",
+    "ga": "아일랜드어",
+    "cy": "웨일스어",
+    "ca": "카탈루냐어",
+    "eu": "바스크어",
+    "la": "라틴어",
+}
+
+
+def language_code_to_korean_label(code: str | None) -> str | None:
+    """langdetect·API가 돌려준 언어 코드를 한글 라벨로 바꾼다."""
+    if not code:
+        return None
+    c = str(code).strip().lower().replace("_", "-")
+    if not c:
+        return None
+    if c in LANG_CODE_TO_KO:
+        return LANG_CODE_TO_KO[c]
+    # zh-cn / zh-tw 등 2차 시도
+    base = c.split("-")[0]
+    return LANG_CODE_TO_KO.get(base, c)
+
+
+def iter_language_like_entries(record: dict[str, Any]) -> dict[str, str]:
+    """
+    레코드 dict에서 '언어'와 관련될 수 있는 모든 키·값을 수집한다.
+
+    공식 문서에 없는 필드가 응답에 실릴 수 있으므로, 키 이름 패턴으로도 훑는다.
+    """
+    out: dict[str, str] = {}
+    priority_exact = {
+        "ORIGINAL_LANG",
+        "ORIGINAL_LANGUAGE",
+        "ORIGINALLANG",
+        "LANG",
+        "LANGUAGE",
+        "LANG_CD",
+        "LANGUAGE_CD",
+        "LANG_CODE",
+        "LANGUAGE_CODE",
+        "TEXT_LANG",
+        "BOOK_LANG",
+        "BOOKLANG",
+        "LAN",
+        "원문언어",
+        "언어",
+    }
+    for key, val in record.items():
+        ks = str(key).strip()
+        if not ks:
+            continue
+        ku = ks.upper()
+        if isinstance(val, (dict, list)):
+            continue
+        s = _strip_or_none(val)
+        if not s:
+            continue
+        if ks in priority_exact or ku in {x.upper() for x in priority_exact}:
+            out[ks] = s
+            continue
+        if "LANGUAGE" in ku or "LANG" in ku or ks == "언어" or "언어" in ks:
+            out[ks] = s
+    return out
+
+
+def resolve_original_lang_from_api(raw: dict[str, Any]) -> str | None:
+    """
+    API가 명시적으로 주는 원문/텍스트 언어 값을 한 가지 문자열로 고른다.
+
+    우선순위는 흔히 쓰일 만한 필드명 순; 없으면 스캔 결과의 첫 값.
+    """
+    for key in (
+        "ORIGINAL_LANG",
+        "ORIGINAL_LANGUAGE",
+        "ORIGINALLANG",
+        "LANGUAGE",
+        "LANG",
+        "LANG_CD",
+        "LANGUAGE_CD",
+        "LANG_CODE",
+        "LANGUAGE_CODE",
+        "TEXT_LANG",
+        "BOOK_LANG",
+        "원문언어",
+        "언어",
+    ):
+        v = _strip_or_none(raw.get(key))
+        if v:
+            return v
+    scanned = iter_language_like_entries(raw)
+    if not scanned:
+        return None
+    # 키 정렬로 출력 순서 고정(디버그·재현성)
+    first_key = sorted(scanned.keys())[0]
+    return scanned[first_key]
+
+
+def format_language_field_scan_report(raw: dict[str, Any]) -> str | None:
+    """사용자에게 보여 줄 'API에서 찾은 언어 관련 필드' 요약 문자열."""
+    scanned = iter_language_like_entries(raw)
+    if not scanned:
+        return None
+    lines = [f"- `{k}` = {v}" for k, v in sorted(scanned.items())]
+    return "\n".join(lines)
+
+
+def detect_language(text: str | None) -> str | None:
+    """
+    원제 등 짧은 본문의 언어를 langdetect로 추정한다.
+
+    짧은 문자열·기호만 있는 경우 LangDetectException이 날 수 있어 None을 반환한다.
+    """
+    if not text:
+        return None
+    sample = text.strip()
+    if len(sample) < 4:
+        return None
+    try:
+        return detect(sample)
+    except LangDetectException:
+        return None
+
+
+def build_display_original_language(
+    *,
+    api_lang_raw: str | None,
+    original_title: str | None,
+) -> str:
+    """
+    상세 화면·표에 넣을 최종 '원문 언어' 문자열을 만든다.
+
+    API 값이 코드(en 등)면 한글명으로 풀고, 이미 한글 등 자유 텍스트면 그대로 둔다.
+    API가 없으면 원제에 대해 langdetect를 시도한다.
+    """
+    if api_lang_raw:
+        s = api_lang_raw.strip()
+        # 대부분의 언어 코드는 짧고 라틴 문자
+        if len(s) <= 12 and re.fullmatch(r"[A-Za-z-]+", s):
+            label = language_code_to_korean_label(s)
+            return f"{label} (API: {s})"
+        return f"{s} (API)"
+
+    code = detect_language(original_title)
+    if code:
+        label = language_code_to_korean_label(code) or code
+        return f"{label} (원제 감지: {code})"
+    return "—"
 
 
 # ---------------------------------------------------------------------------
