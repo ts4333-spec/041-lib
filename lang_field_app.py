@@ -458,6 +458,60 @@ class SeojiApiError(Exception):
         super().__init__(message or code or "Unknown API error")
 
 
+def ensure_resilient_http_adapters(session: requests.Session) -> None:
+    """
+    urllib3 ``Retry``를 세션에 장착해 일시적 연결/HTTP 오류에 대해 추가 복구를 시도한다.
+
+    앱 레벨의 재시도·호스트 우회 루프와 함께 쓰이므로, 여기서는 보수적인 횟수만 둔다.
+    """
+    if getattr(session, "_nl_resilient_http_adapters", False):
+        return
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.75,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    setattr(session, "_nl_resilient_http_adapters", True)
+
+
+def payload_scalar_language_scan(payload: dict[str, Any]) -> dict[str, str]:
+    """
+    최상위 JSON 객체에 도서 레코드 외로 붙어 있을 수 있는 언어 관련 스칼라 필드를 스캔한다.
+
+    보통은 ``docs`` 외 필드가 거의 없지만, API 버전·프록시 변형에 대비한다.
+    """
+    skip = {"docs", "RESULT", "ERR_CODE", "ERR_MESSAGE", "PAGE_NO", "TOTAL_COUNT"}
+    flat: dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in skip or isinstance(v, (list, dict)):
+            continue
+        if isinstance(v, (str, int, float)):
+            flat[str(k)] = v
+    return iter_language_like_entries(flat)
+
+
+def _sleep_backoff_with_jitter(base_sec: float, attempt_index_zero_based: int) -> None:
+    """지수 백오프 + 소량 지터로 뇌동적 재시도 폭주를 줄인다."""
+    exp = min(45.0, float(base_sec) * (2**max(0, attempt_index_zero_based)))
+    jitter = random.uniform(0.0, 0.35 * exp)
+    time.sleep(exp + jitter)
+
+
+def _transport_emit(
+    transport_notify: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if transport_notify:
+        transport_notify(message)
+
+
 def fetch_isbn_records(
     isbn: str,
     cert_key: str,
@@ -467,18 +521,21 @@ def fetch_isbn_records(
     page_size: int = 10,
     session: requests.Session | None = None,
     timeout: float | tuple[float, float] = DEFAULT_HTTP_TIMEOUT,
-    max_retries_per_url: int = 2,
+    max_retries_per_url: int = 3,
     retry_backoff_sec: float = 2.0,
     try_fallback_hosts: bool = True,
-) -> tuple[list[dict[str, Any]], str]:
+    transport_notify: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     """
     ISBN으로 SearchApi를 호출해 원시 레코드(dict) 리스트를 반환한다.
 
     연결 타임아웃이 잦은 환경을 위해 (1) URL 후보를 순차 시도하고
-    (2) 호스트별로 짧은 간격의 재시도(backoff)를 수행한다.
+    (2) 호스트별로 지수 백오프·지터 재시도를 수행하며
+    (3) ``urllib3.Retry`` 어댑터로 일시 HTTP/연결 오류를 보완한다.
 
     Returns:
-        (records, effective_api_url) — 성공한 요청에 사용된 전체 URL 문자열.
+        (records, effective_request_url, raw_payload_dict) — ``raw_payload``는 언어 필드
+        최상위 스캔용(도서 레코드와는 별개).
     """
     params: dict[str, Any] = {
         "cert_key": cert_key,
@@ -488,10 +545,16 @@ def fetch_isbn_records(
         "isbn": isbn,
     }
     sess = session or requests.Session()
+    ensure_resilient_http_adapters(sess)
     candidates = build_api_url_candidates(api_url, include_common_fallbacks=try_fallback_hosts)
     last_exc: BaseException | None = None
 
-    for base in candidates:
+    for host_idx, base in enumerate(candidates):
+        if host_idx > 0:
+            _transport_emit(
+                transport_notify,
+                f"현재 네트워크 상태가 불안정하여 우회 접속 중입니다 ({host_label(base)}).",
+            )
         for attempt in range(max(1, int(max_retries_per_url))):
             try:
                 resp = sess.get(base, params=params, timeout=timeout)
@@ -512,7 +575,7 @@ def fetch_isbn_records(
                     raise SeojiApiError(code, msg)
 
                 records = extract_book_dicts_from_payload(payload)
-                return records, str(resp.url)
+                return records, str(resp.url), payload
 
             except SeojiApiError:
                 raise
@@ -520,13 +583,25 @@ def fetch_isbn_records(
                 last_exc = exc
                 status = getattr(exc.response, "status_code", None) or 0
                 if attempt + 1 < max_retries_per_url and status >= 500:
-                    time.sleep(retry_backoff_sec * (attempt + 1))
+                    _transport_emit(
+                        transport_notify,
+                        "현재 네트워크 상태가 불안정하여 재접속 중입니다 "
+                        f"({host_label(base)}, HTTP {status}, {attempt + 1}/{max_retries_per_url}).",
+                    )
+                    _sleep_backoff_with_jitter(retry_backoff_sec, attempt)
                     continue
                 raise
             except _TRANSIENT_NET_ERRORS as exc:
                 last_exc = exc
-                time.sleep(retry_backoff_sec * (attempt + 1))
-                continue
+                if attempt + 1 < max_retries_per_url:
+                    _transport_emit(
+                        transport_notify,
+                        "현재 네트워크 상태가 불안정하여 재접속 중입니다 "
+                        f"({host_label(base)}, {attempt + 1}/{max_retries_per_url}).",
+                    )
+                    _sleep_backoff_with_jitter(retry_backoff_sec, attempt)
+                    continue
+                break
 
     hosts = ", ".join(host_label(u) for u in candidates)
     detail = str(last_exc) if last_exc else "알 수 없음"
@@ -535,11 +610,32 @@ def fetch_isbn_records(
     ) from last_exc
 
 
-def record_to_display_row(isbn_query: str, raw: dict[str, Any]) -> dict[str, Any]:
+def compose_language_debug_markdown(raw: dict[str, Any], payload_top: dict[str, Any] | None) -> str | None:
+    """API 응답에서 언어 관련 키가 숨어 있는지 확인하기 위한 마크다운 요약."""
+    parts: list[str] = []
+    rec = format_language_field_scan_report(raw)
+    if rec:
+        parts.append("**도서 레코드 내 언어 관련 필드**\n" + rec)
+    if payload_top:
+        top = payload_scalar_language_scan(payload_top)
+        if top:
+            lines = "\n".join(f"- `{k}` = {v}" for k, v in sorted(top.items()))
+            parts.append("**응답 최상위(도서 레코드 외) 스칼라 필드**\n" + lines)
+    return "\n\n".join(parts) if parts else None
+
+
+def record_to_display_row(
+    isbn_query: str,
+    raw: dict[str, Any],
+    *,
+    payload_top: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     API 원시 레코드를 화면·CSV·DataFrame에 쓰기 좋은 표준 행(dict)으로 변환한다.
 
-    출력 컬럼명은 요구사항(TITLE, ORIGINAL_TITLE, …, IMAGE_URL)에 맞춘다.
+    ``LANG`` / ``LANGUAGE`` 등 API 언어 힌트와 원제 텍스트를 ``build_display_original_language``로 합쳐
+    사용자에게 보여 줄 문자열을 ``ORIGINAL_LANG`` 키에 담는다.
+    ``LANGUAGE_DEBUG`` 는 UI 전용(표·CSV에서는 제외).
     """
     ea_isbn = _strip_or_none(raw.get("EA_ISBN")) or normalize_isbn(isbn_query)
     title = _strip_or_none(raw.get("TITLE"))
@@ -550,14 +646,20 @@ def record_to_display_row(isbn_query: str, raw: dict[str, Any]) -> dict[str, Any
     pub_date = resolve_publish_date(raw)
     image_url = resolve_image_url(raw)
 
+    orig_lang_api = resolve_original_lang_from_api(raw)
+    orig_lang_display = build_display_original_language(api_lang_raw=orig_lang_api, original_title=original)
+    lang_debug = compose_language_debug_markdown(raw, payload_top)
+
     return {
         "ISBN": ea_isbn,
         "TITLE": title,
         "ORIGINAL_TITLE": original,
+        "ORIGINAL_LANG": orig_lang_display,
         "AUTHOR": author,
         "PUBLISHER": publisher,
         "REAL_PUBLISH_DATE": pub_date,
         "IMAGE_URL": image_url,
+        "LANGUAGE_DEBUG": lang_debug,
     }
 
 
@@ -568,9 +670,10 @@ def process_isbn_lookup(
     api_url: str,
     session: requests.Session | None = None,
     timeout: float | tuple[float, float] = DEFAULT_HTTP_TIMEOUT,
-    max_retries_per_url: int = 2,
+    max_retries_per_url: int = 3,
     retry_backoff_sec: float = 2.0,
     try_fallback_hosts: bool = True,
+    transport_notify: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
     단일 ISBN 조회의 '오케스트레이션': 검증 → 호출 → 첫 레코드 선택 → 표시행 변환.
@@ -585,7 +688,7 @@ def process_isbn_lookup(
         raise ValueError("ISBN을 입력해 주세요.")
 
     primary = (api_url or "").strip()
-    records, effective = fetch_isbn_records(
+    records, effective, payload_top = fetch_isbn_records(
         n_isbn,
         cert_key,
         api_url=primary,
@@ -595,13 +698,14 @@ def process_isbn_lookup(
         max_retries_per_url=max_retries_per_url,
         retry_backoff_sec=retry_backoff_sec,
         try_fallback_hosts=try_fallback_hosts,
+        transport_notify=transport_notify,
     )
     if not records:
         return None, "해당 ISBN으로 조회된 서지가 없습니다. 납본·CIP 여부 및 ISBN 자릿수를 확인해 주세요."
 
     # ISBN 검색이므로 보통 첫 행이 일치 도서. 여러 건이면 첫 레코드를 사용하고 안내.
     chosen = records[0]
-    row = record_to_display_row(n_isbn, chosen)
+    row = record_to_display_row(n_isbn, chosen, payload_top=payload_top)
     warn: list[str] = []
     if len(records) > 1:
         warn.append(f"동일 조건으로 {len(records)}건이 반환되어 첫 번째 결과만 표시합니다.")
@@ -619,12 +723,17 @@ def dataframe_from_rows(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
         "ISBN",
         "TITLE",
         "ORIGINAL_TITLE",
+        "ORIGINAL_LANG",
         "AUTHOR",
         "PUBLISHER",
         "REAL_PUBLISH_DATE",
         "IMAGE_URL",
     ]
-    return pd.DataFrame(list(rows), columns=cols)
+    df = pd.DataFrame(list(rows))
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
 
 
 def rows_to_csv_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
@@ -642,7 +751,7 @@ def batch_process_isbns(
     api_url: str = DEFAULT_SEARCH_API_URL,
     on_error: str = "skip",
     timeout: float | tuple[float, float] = DEFAULT_HTTP_TIMEOUT,
-    max_retries_per_url: int = 2,
+    max_retries_per_url: int = 3,
     retry_backoff_sec: float = 2.0,
     try_fallback_hosts: bool = True,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
@@ -731,7 +840,7 @@ def main() -> None:
         )
         c_timeout = st.number_input("연결 타임아웃(초)", min_value=5, max_value=180, value=45, step=5)
         r_timeout = st.number_input("읽기 타임아웃(초)", min_value=15, max_value=600, value=120, step=15)
-        retries = st.number_input("호스트당 재시도 횟수", min_value=1, max_value=8, value=2, step=1)
+        retries = st.number_input("호스트당 재시도 횟수", min_value=1, max_value=10, value=3, step=1)
         backoff = st.number_input("재시도 간격(초)", min_value=0.5, max_value=30.0, value=2.0, step=0.5)
         st.divider()
         if st.button("누적 목록 비우기", type="secondary"):
@@ -751,7 +860,12 @@ def main() -> None:
         if not cert_key or not cert_key.strip():
             st.error("사이드바에 API 인증키(cert_key)를 입력해 주세요.")
         else:
+            net_status = st.empty()
             try:
+
+                def _transport_toast(msg: str) -> None:
+                    net_status.info(msg)
+
                 with st.spinner("국립중앙도서관 API에 요청 중입니다…"):
                     sess = requests.Session()
                     row, warn = process_isbn_lookup(
@@ -763,7 +877,9 @@ def main() -> None:
                         max_retries_per_url=int(retries),
                         retry_backoff_sec=float(backoff),
                         try_fallback_hosts=try_fallback,
+                        transport_notify=_transport_toast,
                     )
+                net_status.empty()
                 if row is None:
                     st.warning(warn or "조회 결과가 없습니다.")
                 else:
@@ -773,16 +889,20 @@ def main() -> None:
                     st.session_state.accumulated_rows.append(row)
                     st.success("조회에 성공했습니다. 아래 상세를 확인하세요.")
             except SeojiApiError as e:
+                net_status.empty()
                 code = e.code or ""
                 hint = ERR_CODE_MESSAGES.get(code, "")
                 st.error(f"API 오류 [{code}]: {e.message or '알 수 없는 오류'}")
                 if hint:
                     st.caption(hint)
             except requests.HTTPError as e:
+                net_status.empty()
                 st.error(f"HTTP 오류: {e}")
             except ValueError as e:
+                net_status.empty()
                 st.warning(str(e))
             except requests.RequestException as e:
+                net_status.empty()
                 st.error(redact_cert_key_in_text(f"네트워크 요청 중 문제가 발생했습니다: {e}"))
                 with st.expander("연결이 계속 안 될 때"):
                     st.markdown(
@@ -807,12 +927,22 @@ def main() -> None:
                 f"""
 **국문 제목:** {last.get('TITLE') or '—'}  
 **원제:** {last.get('ORIGINAL_TITLE') or '—'}  
+**원문 언어:** {last.get('ORIGINAL_LANG') or '—'}  
 **저자/번역자:** {last.get('AUTHOR') or '—'}  
 **출판사:** {last.get('PUBLISHER') or '—'}  
 **발행일(또는 출판예정일 등):** {last.get('REAL_PUBLISH_DATE') or '—'}  
 **ISBN:** {last.get('ISBN') or '—'}  
 """
             )
+            dbg = last.get("LANGUAGE_DEBUG")
+            if dbg:
+                with st.expander("API 응답에서 스캔한 언어 관련 필드"):
+                    st.markdown(dbg)
+            else:
+                st.caption(
+                    "도서 레코드·응답 최상위에 LANGUAGE/LANG 계열 스칼라 필드가 없습니다. "
+                    "원문 언어는 가능한 경우 원제 텍스트 감지로 보완됩니다."
+                )
             if last.get("IMAGE_URL"):
                 st.markdown(f"[표지 원본 링크]({last['IMAGE_URL']})")
 
