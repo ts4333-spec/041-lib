@@ -1,420 +1,487 @@
 """
-lang_field_app.py
-────────────────────────────────────────────────────────
-041(언어코드) · 546(언어주기) 필드 단독 테스트 앱
-ISBN 입력 → 도서관 정보나루(data4library.kr) API 조회 → 필드 생성
+번역서–원서 정보 추출 대시보드 (국립중앙도서관 ISBN/CIP Search API)
 
-인증키: 공공데이터포털(data.go.kr) 마이페이지에서 발급한 키를
-        Streamlit Secrets에 아래와 같이 등록하세요.
-        [data4library]
-        auth_key = "발급받은키"
-────────────────────────────────────────────────────────
+- 단일 ISBN 조회 UI + 세션에 성공 건 누적
+- `fetch_isbn_records` / `record_to_display_row` 등으로 대량 ISBN 배치 처리로 확장하기 쉬운 구조
 """
 
-import os
+from __future__ import annotations
+
+import io
 import re
+from typing import Any, Iterable
+
+import pandas as pd
 import requests
-
 import streamlit as st
-from openai import OpenAI
-from lang_field import LangFieldBuilder, ISDS_LANGUAGE_CODES
 
-# ── 페이지 설정 ──────────────────────────────────────
-st.set_page_config(
-    page_title="041 · 546 필드 생성기",
-    page_icon="📚",
-    layout="centered",
-)
+# ---------------------------------------------------------------------------
+# 상수: API 기본 설정 (엔드포인트만 바꿔서 스테이징/미러 등으로 교체 가능)
+# ---------------------------------------------------------------------------
 
-st.title("📚 KORMARC 041 · 546 필드 생성기")
-st.caption("ISBN을 입력하면 도서관 정보나루 서지정보를 자동으로 불러와 언어코드(041)와 언어주기(546) 필드를 생성합니다.")
+# 공식 문서 기준 ISBN 서지 검색 API (JSON)
+DEFAULT_SEARCH_API_URL = "https://www.nl.go.kr/seoji/SearchApi.do"
 
-# ── Secrets / 환경변수 ───────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
-DATA4LIB_KEY = (
-    os.getenv("DATA4LIB_KEY")
-    or st.secrets.get("DATA4LIB_KEY", "")
-    or (st.secrets.get("data4library") or {}).get("auth_key", "")
-)
+# 일부 자료에서 사용하는 대체 호스트 (필요 시 사이드바에서 URL 오버라이드 가능)
+ALTERNATE_SEARCH_API_URL = "https://seoji.nl.go.kr/landingPage/SearchApi.do"
 
-if not OPENAI_API_KEY:
-    st.error("⚠️ OPENAI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 등록해주세요.")
-    st.stop()
+# HTTP 타임아웃(초): 네트워크 지연 시 무한 대기 방지
+REQUEST_TIMEOUT_SEC = 30
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ── 디버그 로그 수집 ──────────────────────────────────
-debug_lines: list[str] = []
-def dbg(*args):
-    debug_lines.append(" ".join(str(a) for a in args))
-def dbg_err(*args):
-    debug_lines.append("❌ " + " ".join(str(a) for a in args))
-
-builder = LangFieldBuilder(
-    openai_client=client,
-    model=(st.secrets.get("openai", {}) or {}).get("model", "gpt-4o"),
-    dbg_fn=dbg,
-    dbg_err_fn=dbg_err,
-)
-
-
-# ══════════════════════════════════════════════════════
-# KDC 번호 → categoryText / subject_lang 변환
-# ══════════════════════════════════════════════════════
-
-_KDC_TOP: dict[str, str] = {
-    "0": "총류", "1": "철학", "2": "종교",
-    "3": "사회과학", "4": "자연과학", "5": "기술과학",
-    "6": "예술", "7": "언어", "8": "문학", "9": "역사",
-}
-
-# 앞 2자리 기준: 81x=한국, 82x=중국, 83x=일본, 84x=영미,
-# 85x=독일, 86x=프랑스, 87x=스페인, 88x=이탈리아
-_KDC_LIT_LANG: dict[str, str] = {
-    "81": "kor", "82": "chi", "83": "jpn",
-    "84": "eng", "85": "ger", "86": "fre",
-    "87": "spa", "88": "ita",
-}
-_KDC_LIT_NAMES: dict[str, str] = {
-    "chi": "중국문학", "jpn": "일본문학", "eng": "영미문학",
-    "ger": "독일문학", "fre": "프랑스문학", "spa": "스페인문학",
-    "ita": "이탈리아문학",
+# API 에러 코드 → 사용자 안내 문구 (문서: books.nl.go.kr ISBN 서지정보 활용방법)
+ERR_CODE_MESSAGES: dict[str, str] = {
+    "000": "시스템 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+    "010": "인증키(cert_key)가 요청에 포함되지 않았습니다.",
+    "011": "유효하지 않은 인증키입니다. 국립중앙도서관에서 발급받은 키인지 확인해 주세요.",
+    "012": "필수 파라미터가 누락되었습니다. (cert_key, result_style, page_no, page_size)",
 }
 
 
-def _parse_kdc(kdc: str) -> str:
-    """'813.6' → '813',  '843' → '843'"""
-    return re.sub(r"[^\d]", "", (kdc or "").split(".")[0])
+# ---------------------------------------------------------------------------
+# ISBN 정규화 / 문자열 유틸
+# ---------------------------------------------------------------------------
 
 
-def kdc_to_category_text(kdc: str) -> str:
-    digits = _parse_kdc(kdc)
-    if not digits:
-        return ""
-    top = digits[0]
-    if top == "8":
-        if len(digits) >= 2:
-            p2 = digits[:2]
-            if p2 == "81":
-                return "국내도서>문학>한국문학"
-            lang = _KDC_LIT_LANG.get(p2)
-            if lang:
-                return f"외국도서>문학>{_KDC_LIT_NAMES.get(lang, '외국문학')}"
-        return "외국도서>문학"
-    if top == "9":
-        return "외국도서>역사"
-    name = _KDC_TOP.get(top, "")
-    return f"외국도서>{name}" if name else ""
+def normalize_isbn(isbn: str) -> str:
+    """
+    ISBN 입력값에서 하이픈·공백을 제거해 숫자(및 X)만 남긴다.
+
+    대량 처리 시에도 동일 함수를 재사용하면 입력 파편화를 한곳에서 관리할 수 있다.
+    """
+    cleaned = re.sub(r"[^0-9Xx]", "", (isbn or "").strip())
+    return cleaned.upper()
 
 
-def kdc_to_subject_lang(kdc: str) -> str | None:
-    digits = _parse_kdc(kdc)
-    if len(digits) >= 2 and digits[0] == "8":
-        p2 = digits[:2]
-        return "kor" if p2 == "81" else _KDC_LIT_LANG.get(p2)
+def _strip_or_none(value: Any) -> str | None:
+    """API 필드가 빈 문자열·None일 때 None으로 통일."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+# ---------------------------------------------------------------------------
+# 원제(ORIGINAL_TITLE) 추출: API 필드 부재 시 저자 문자열에서 보조 추출
+# ---------------------------------------------------------------------------
+
+# "원저:", "Original Title:" 등 키워드 뒤의 텍스트를 잡기 위한 정규식 (대소문자 무시)
+_ORIGINAL_TITLE_PATTERNS: list[re.Pattern[str]] = [
+    # 구분자(세미콜론·슬래시 등) 또는 줄바꿈 전까지, 없으면 문자열 끝까지
+    re.compile(
+        r"(?:원저|원제|원\s*저|원\s*제)\s*[:：]\s*(?P<t>.+?)(?=\s*(?:;|；|/|\||\n)|$)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"Original\s*Title\s*[:：]\s*(?P<t>.+?)(?=\s*(?:;|；|/|\||\n)|$)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"원\s*제목\s*[:：]\s*(?P<t>.+?)(?=\s*(?:;|；|/|\||\n)|$)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+
+def extract_original_title_from_author(author: str | None) -> str | None:
+    """
+    AUTHOR 필드에 원제가 함께 기재된 경우(예: '번역자 지음 ; 원저: The Hobbit')에서 원제를 추출한다.
+
+    API에 ORIGINAL_TITLE 전용 필드가 없거나 비어 있을 때만 사용한다.
+    """
+    if not author:
+        return None
+    text = author.strip()
+    for pat in _ORIGINAL_TITLE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            candidate = m.group("t").strip()
+            # 괄호·따옴표만 있는 경우 등 지나치게 짧은 노이즈는 버린다
+            if len(candidate) >= 2:
+                return candidate
     return None
 
 
-def extract_original_title_from_title(title: str) -> str:
-    """제목 병기에서 원제 파싱. 예: '어린 왕자(Le Petit Prince)' → 'Le Petit Prince'"""
-    title = (title or "").strip()
-    if not title:
-        return ""
-
-    def _is_foreign(t: str) -> bool:
-        t = t.strip()
-        if not t:
-            return False
-        ascii_cnt = sum(1 for c in t if ord(c) < 128 and c not in " \t")
-        return ascii_cnt / max(len(t.replace(" ", "")), 1) >= 0.5
-
-    m = re.search(r"[(\[（【]([^)\]）】]{2,})[)\]）】]", title)
-    if m and _is_foreign(m.group(1)):
-        return m.group(1).strip()
-    m = re.search(r"[:=\/]\s*([A-Za-z][^\:=\/]{1,80})$", title)
-    if m and _is_foreign(m.group(1)):
-        return m.group(1).strip()
-    return ""
-
-
-# ══════════════════════════════════════════════════════
-# 도서관 정보나루 API (data4library.kr)
-# ══════════════════════════════════════════════════════
-# 엔드포인트: http://data4library.kr/api/srchDtlList
-# 인증키: 공공데이터포털(data.go.kr) 발급 키 (authKey 파라미터)
-# ISBN-13만 넘기면 도서명·저자·출판사·KDC·표지이미지 반환
-
-_D4L_URL = "http://data4library.kr/api/srchDtlList"
-
-
-def data4lib_isbn_lookup(isbn13: str) -> tuple[dict, dict]:
+def resolve_original_title(raw: dict[str, Any]) -> str | None:
     """
-    도서관 정보나루 API로 ISBN-13 조회 →
-    LangFieldBuilder가 기대하는 (item, detail) 딕셔너리로 변환.
+    응답 dict에서 원제를 결정한다.
 
-    반환: (item, detail)  실패 시 ({}, {})
+    우선순위:
+    1) API가 제공하는 표준/비표준 키 (버전 차이 대비)
+    2) AUTHOR 문자열 정규식 보조 추출
     """
-    if not DATA4LIB_KEY:
-        dbg_err("DATA4LIB_KEY가 설정되지 않았습니다.")
-        return {}, {}
+    for key in (
+        "ORIGINAL_TITLE",
+        "ORIGINALTITLE",
+        "ORIGINAL TITLE",
+        "ORIGINAL_WORK_TITLE",
+        "원제",
+    ):
+        if key in raw:
+            v = _strip_or_none(raw.get(key))
+            if v:
+                return v
+    return extract_original_title_from_author(_strip_or_none(raw.get("AUTHOR")))
 
-    params = {
-        "authKey":    DATA4LIB_KEY,
-        "isbn13":     isbn13,
-        "loaninfoYN": "N",   # 대출통계 제외 (빠른 응답)
-        "format":     "json",
+
+# ---------------------------------------------------------------------------
+# 발행일: 문서상 PUBLISH_PREDATE(출판예정일) 등을 REAL_PUBLISH_DATE 슬롯에 매핑
+# ---------------------------------------------------------------------------
+
+
+def resolve_publish_date(raw: dict[str, Any]) -> str | None:
+    """
+    '실제 발행일'에 해당하는 값을 가능한 한 채운다.
+
+    공식 문서에는 PUBLISH_PREDATE(출판예정일)가 명시되어 있으며,
+    일부 응답 스키마에는 REAL_PUBLISH_DATE 등 추가 키가 있을 수 있어 순차 시도한다.
+    """
+    for key in (
+        "REAL_PUBLISH_DATE",
+        "REAL_PUBLISHDATE",
+        "PUBLISH_DATE",
+        "PUBLISH_DATE_REAL",
+        "PUBLISH_PREDATE",
+        "PUBLISHDATE",
+    ):
+        v = _strip_or_none(raw.get(key))
+        if v:
+            return v
+    return None
+
+
+def resolve_image_url(raw: dict[str, Any]) -> str | None:
+    """표지 URL: 문서 필드명은 TITLE_URL이며, 다른 키가 있으면 그것도 허용한다."""
+    for key in ("TITLE_URL", "IMAGE_URL", "COVER_URL", "IMG_URL"):
+        v = _strip_or_none(raw.get(key))
+        if v:
+            return v
+    return None
+
+
+# ---------------------------------------------------------------------------
+# JSON 응답에서 도서 레코드 목록 추출 (스키마 변형에 강하게)
+# ---------------------------------------------------------------------------
+
+
+def extract_book_dicts_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    SearchApi JSON 최상위 객체에서 도서 레코드(dict)들의 리스트를 꺼낸다.
+
+    문서 예시와 실제 응답이 항상 일치하지 않을 수 있어,
+    `docs` 배열 우선 + 그 외 'dict의 리스트' 탐색으로 완화한다.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    docs = payload.get("docs")
+    if isinstance(docs, list):
+        return [d for d in docs if isinstance(d, dict)]
+
+    skip_keys = {"RESULT", "ERR_CODE", "ERR_MESSAGE", "PAGE_NO", "TOTAL_COUNT"}
+    for key, val in payload.items():
+        if key in skip_keys:
+            continue
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return [d for d in val if isinstance(d, dict)]
+
+    # 단일 레코드가 최상위에 평탄하게 오는 비표준 케이스
+    if any(k in payload for k in ("EA_ISBN", "TITLE", "AUTHOR")) and "RESULT" not in payload:
+        return [payload]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# API 호출 계층 (requests 단일 진입점 → 이후 배치 루프에서 그대로 재사용)
+# ---------------------------------------------------------------------------
+
+
+class SeojiApiError(Exception):
+    """국립중앙도서관 서지 API가 RESULT=ERROR로 응답할 때."""
+
+    def __init__(self, code: str | None, message: str | None):
+        self.code = code
+        self.message = message
+        super().__init__(message or code or "Unknown API error")
+
+
+def fetch_isbn_records(
+    isbn: str,
+    cert_key: str,
+    *,
+    api_url: str = DEFAULT_SEARCH_API_URL,
+    page_no: int = 1,
+    page_size: int = 10,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """
+    ISBN으로 SearchApi를 호출해 원시 레코드(dict) 리스트를 반환한다.
+
+    대량 ISBN 처리 시에는 동일 `requests.Session`을 넘겨 연결 재사용(Keep-Alive)을 권장한다.
+    """
+    params: dict[str, Any] = {
+        "cert_key": cert_key,
+        "result_style": "json",
+        "page_no": page_no,
+        "page_size": page_size,
+        "isbn": isbn,
     }
+    sess = session or requests.Session()
+    resp = sess.get(api_url, params=params, timeout=REQUEST_TIMEOUT_SEC)
+    resp.raise_for_status()
 
-    dbg(f"📡 [data4library] 조회 시작: ISBN={isbn13}")
     try:
-        resp = requests.get(_D4L_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        dbg_err(f"data4library API 네트워크 오류: {e}")
-        return {}, {}
-    except ValueError as e:
-        dbg_err(f"data4library API JSON 파싱 오류: {e}")
-        return {}, {}
+        payload = resp.json()
+    except ValueError as exc:
+        raise ValueError("API 응답이 JSON이 아닙니다. result_style=json 및 URL을 확인해 주세요.") from exc
 
-    # 오류 응답 확인
-    response = data.get("response", {})
-    error    = response.get("error")
-    if error:
-        dbg_err(f"data4library API 오류: {error}")
-        return {}, {}
+    if not isinstance(payload, dict):
+        raise ValueError("API JSON 최상위 구조가 객체(dict)가 아닙니다.")
 
-    # 결과 추출 — response.detail[0].book
-    detail_list = response.get("detail")
-    if not detail_list:
-        dbg("📡 [data4library] 검색 결과 없음")
-        return {}, {}
+    if payload.get("RESULT") == "ERROR":
+        code = _strip_or_none(payload.get("ERR_CODE"))
+        msg = _strip_or_none(payload.get("ERR_MESSAGE"))
+        raise SeojiApiError(code, msg)
 
-    # detail은 리스트 또는 단일 dict일 수 있음
-    if isinstance(detail_list, list):
-        book = detail_list[0].get("book", detail_list[0])
-    else:
-        book = detail_list.get("book", detail_list)
+    records = extract_book_dicts_from_payload(payload)
+    return records
 
-    def _f(key: str) -> str:
-        return (book.get(key) or "").strip()
 
-    raw_title  = _f("bookname")
-    raw_author = _f("authors")
-    publisher  = _f("publisher")
-    pub_year   = _f("publication_year")[:4]
-    kdc_raw    = _f("class_no")       # KDC 분류번호
-    cover_url  = _f("bookImageURL")
+def record_to_display_row(isbn_query: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    API 원시 레코드를 화면·CSV·DataFrame에 쓰기 좋은 표준 행(dict)으로 변환한다.
 
-    dbg(f"📡 [data4library] 응답 수신: '{raw_title or '(제목없음)'}'")
+    출력 컬럼명은 요구사항(TITLE, ORIGINAL_TITLE, …, IMAGE_URL)에 맞춘다.
+    """
+    ea_isbn = _strip_or_none(raw.get("EA_ISBN")) or normalize_isbn(isbn_query)
+    title = _strip_or_none(raw.get("TITLE"))
+    author = _strip_or_none(raw.get("AUTHOR"))
+    publisher = _strip_or_none(raw.get("PUBLISHER"))
 
-    # 저자 정제 (역할어 제거)
-    author = re.sub(r"\s*(지음|옮김|역|편|저|글|그림|감수|공저).*$", "", raw_author).strip()
+    original = resolve_original_title(raw)
+    pub_date = resolve_publish_date(raw)
+    image_url = resolve_image_url(raw)
 
-    # KDC → 카테고리 & 언어 힌트
-    category_text = kdc_to_category_text(kdc_raw)
-    subject_lang  = kdc_to_subject_lang(kdc_raw)
-    if kdc_raw:
-        dbg(f"📡 [data4library] KDC={kdc_raw} → category='{category_text}', lang={subject_lang}")
-    else:
-        dbg("📡 [data4library] KDC 정보 없음 — GPT 판정으로 폴백")
-
-    # 원제 추출
-    original_title = extract_original_title_from_title(raw_title)
-    if original_title:
-        dbg(f"📡 [data4library] 제목 병기에서 원제 파싱: '{original_title}'")
-
-    dbg(f"📡 [data4library] 완료 — 원제: '{original_title or '(없음)'}', subject_lang: {subject_lang}")
-
-    item: dict = {
-        "title":        raw_title,
-        "publisher":    publisher,
-        "author":       author,
-        "categoryText": category_text,
-        "subInfo":      {"originalTitle": original_title} if original_title else {},
-        # UI 전용
-        "_pub_year":   pub_year,
-        "_cover":      cover_url,
-        "_raw_author": raw_author,
-        "_kdc":        kdc_raw,
+    return {
+        "ISBN": ea_isbn,
+        "TITLE": title,
+        "ORIGINAL_TITLE": original,
+        "AUTHOR": author,
+        "PUBLISHER": publisher,
+        "REAL_PUBLISH_DATE": pub_date,
+        "IMAGE_URL": image_url,
     }
-    detail_out: dict = {
-        "original_title": original_title,
-        "subject_lang":   subject_lang,
-        "category_text":  category_text,
-    }
-    return item, detail_out
 
 
-# ══════════════════════════════════════════════════════
-# UI
-# ══════════════════════════════════════════════════════
-st.divider()
+def process_isbn_lookup(
+    isbn_input: str,
+    cert_key: str,
+    *,
+    api_url: str,
+    session: requests.Session | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    단일 ISBN 조회의 '오케스트레이션': 검증 → 호출 → 첫 레코드 선택 → 표시행 변환.
 
-isbn_input = st.text_input(
-    "📖 ISBN-13 입력",
-    placeholder="예: 9788937462849",
-    max_chars=13,
-)
+    Returns:
+        (row, warning_message) — 성공 시 row는 dict, warning은 보조 안내(선택).
+        실패는 예외가 아니라 Streamlit에서 메시지 처리할 수 있도록 상위에서 잡는 패턴도 가능하나,
+        여기서는 예외를 그대로 올려 HTTP/JSON 문제를 구분한다.
+    """
+    n_isbn = normalize_isbn(isbn_input)
+    if not n_isbn:
+        raise ValueError("ISBN을 입력해 주세요.")
 
-fetch_btn = st.button("🔎 도서 정보 불러오기", use_container_width=True)
+    records = fetch_isbn_records(n_isbn, cert_key, api_url=api_url, page_size=10, session=session)
+    if not records:
+        return None, "해당 ISBN으로 조회된 서지가 없습니다. 납본·CIP 여부 및 ISBN 자릿수를 확인해 주세요."
 
-# ── ISBN 조회 ─────────────────────────────────────────
-if fetch_btn and isbn_input:
-    isbn = isbn_input.strip().replace("-", "")
-    if len(isbn) != 13 or not isbn.isdigit():
-        st.error("ISBN-13은 숫자 13자리여야 합니다.")
-        st.stop()
+    # ISBN 검색이므로 보통 첫 행이 일치 도서. 여러 건이면 첫 레코드를 사용하고 안내.
+    chosen = records[0]
+    row = record_to_display_row(n_isbn, chosen)
+    warn = None
+    if len(records) > 1:
+        warn = f"동일 조건으로 {len(records)}건이 반환되어 첫 번째 결과만 표시합니다."
+    return row, warn
 
-    if not DATA4LIB_KEY:
-        st.error(
-            "⚠️ DATA4LIB_KEY가 설정되지 않았습니다.  \n"
-            "공공데이터포털(https://www.data.go.kr) 마이페이지에서 인증키를 확인하고 "
-            "Streamlit Secrets에 등록해주세요."
-        )
-        st.stop()
 
-    debug_lines.clear()
-    with st.spinner("도서관 정보나루에서 서지정보 조회 중…"):
-        api_item, crawl_det = data4lib_isbn_lookup(isbn)
+def dataframe_from_rows(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
+    """누적 리스트를 pandas DataFrame으로 변환한다 (컬럼 순서 고정)."""
+    cols = [
+        "ISBN",
+        "TITLE",
+        "ORIGINAL_TITLE",
+        "AUTHOR",
+        "PUBLISHER",
+        "REAL_PUBLISH_DATE",
+        "IMAGE_URL",
+    ]
+    return pd.DataFrame(list(rows), columns=cols)
 
-    if not api_item:
-        st.error("도서 정보를 찾을 수 없습니다. ISBN을 확인하거나 인증키를 점검해주세요.")
-        with st.expander("🧭 조회 로그 보기"):
-            st.text("\n".join(debug_lines) if debug_lines else "로그 없음")
-        st.stop()
 
-    st.session_state["api_item"]  = api_item
-    st.session_state["crawl_det"] = crawl_det
-    st.session_state["isbn"]      = isbn
+def rows_to_csv_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
+    """다운로드용 UTF-8 BOM CSV 바이트 (엑셀 한글 깨짐 방지)."""
+    df = dataframe_from_rows(rows)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    return buf.getvalue().encode("utf-8-sig")
 
-# ── 도서 정보 표시 & 수정 폼 ──────────────────────────
-if "api_item" in st.session_state:
-    item   = st.session_state["api_item"]
-    detail = st.session_state["crawl_det"]
 
-    subinfo       = (item.get("subInfo") or {})
-    orig_from_api = (subinfo.get("originalTitle") or "").strip()
+def batch_process_isbns(
+    isbns: Iterable[str],
+    cert_key: str,
+    *,
+    api_url: str = DEFAULT_SEARCH_API_URL,
+    on_error: str = "skip",
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """
+    여러 ISBN을 순차 처리한다 (향후 ThreadPoolExecutor / asyncio로 확장하기 쉬운 동기 버전).
 
-    st.divider()
-    st.subheader("📋 불러온 도서 정보")
+    Args:
+        isbns: ISBN 문자열 iterable (정규화는 내부에서 수행).
+        cert_key: API 인증키.
+        api_url: SearchApi 엔드포인트.
+        on_error: ``skip``이면 실패 ISBN은 건너뛰고 ``errors``에만 기록,
+                  ``raise``이면 첫 예외에서 중단.
 
-    cover     = item.get("_cover", "")
-    meta_line = (
-        f"{item.get('_raw_author', item.get('author', ''))}  |  "
-        f"{item.get('publisher', '')}  |  "
-        f"{item.get('_pub_year', '')}"
+    Returns:
+        (성공 행들, (isbn, 에러메시지) 목록)
+    """
+    session = requests.Session()
+    ok: list[dict[str, Any]] = []
+    errors: list[tuple[str, str]] = []
+
+    for raw_isbn in isbns:
+        label = normalize_isbn(str(raw_isbn))
+        if not label:
+            errors.append((str(raw_isbn), "빈 ISBN"))
+            continue
+        try:
+            row, _warn = process_isbn_lookup(raw_isbn, cert_key, api_url=api_url, session=session)
+        except (SeojiApiError, ValueError, requests.RequestException) as exc:
+            errors.append((label, str(exc)))
+            if on_error == "raise":
+                raise
+            continue
+        if row is None:
+            errors.append((label, "조회 결과 없음"))
+            continue
+        ok.append(row)
+    return ok, errors
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+
+
+def _init_session_state() -> None:
+    if "accumulated_rows" not in st.session_state:
+        st.session_state.accumulated_rows = []
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="번역서–원서 정보 추출",
+        layout="wide",
     )
-    kdc_caption = f"KDC: {item['_kdc']}" if item.get("_kdc") else ""
+    _init_session_state()
 
-    if cover:
-        col_img, col_info = st.columns([1, 3])
-        with col_img:
-            st.image(cover, width=110)
-        with col_info:
-            st.markdown(f"**{item.get('title', '')}**")
-            st.caption(meta_line)
-            if kdc_caption:
-                st.caption(kdc_caption)
-    else:
-        st.markdown(f"**{item.get('title', '')}**")
-        st.caption(meta_line)
-        if kdc_caption:
-            st.caption(kdc_caption)
+    st.title("번역서–원서 정보 추출 대시보드")
+    st.caption("국립중앙도서관 ISBN 서지 Search API (`SearchApi.do`, JSON) 기반")
 
-    st.divider()
-    st.subheader("✏️ 정보 확인 · 수정 후 필드 생성")
-    st.caption("자동으로 채워진 값을 확인하고 필요하면 수정하세요.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        title     = st.text_input("제목",   value=item.get("title", ""))
-        publisher = st.text_input("출판사", value=item.get("publisher", ""))
-        author    = st.text_input("저자",   value=item.get("author", ""))
-    with col2:
-        original_title = st.text_input(
-            "원제",
-            value=orig_from_api or detail.get("original_title", ""),
+    with st.sidebar:
+        st.header("API 설정")
+        cert_key = st.text_input(
+            "cert_key (인증키)",
+            type="password",
+            help="국립중앙도서관 ISBN 서지 Open API에서 발급받은 인증키를 입력합니다.",
         )
-        category_text = st.text_input(
-            "카테고리 (KDC 변환값)",
-            value=item.get("categoryText", "") or detail.get("category_text", ""),
-            help="KDC에서 자동 변환됩니다. 직접 수정도 가능합니다. 예: 국내도서>문학>한국문학",
+        api_url = st.text_input(
+            "API URL",
+            value=DEFAULT_SEARCH_API_URL,
+            help=f"기본: 공식 문서의 주소. 필요 시 대체 엔드포인트로 변경할 수 있습니다.\n예: {ALTERNATE_SEARCH_API_URL}",
         )
-        subject_lang = st.text_input(
-            "언어 힌트 (선택)",
-            value=detail.get("subject_lang", "") or "",
-            placeholder="예: jpn  (KDC 문학 분류에서 자동 감지)",
-        )
-
-    run_btn = st.button("🚀 041 · 546 필드 생성", type="primary", use_container_width=True)
-
-    if run_btn:
-        debug_lines.clear()
-
-        final_item = {
-            "title":        title,
-            "publisher":    publisher,
-            "author":       author,
-            "categoryText": category_text,
-            "subInfo":      {"originalTitle": original_title} if original_title else {},
-        }
-        final_detail = {
-            "original_title": original_title,
-            "subject_lang":   subject_lang or None,
-            "category_text":  category_text,
-        }
-
-        with st.spinner("언어 판정 중…"):
-            tag_041, tag_546, orig = builder.get_kormarc_tags(final_item, final_detail)
-
         st.divider()
-        st.subheader("✅ 생성 결과")
+        if st.button("누적 목록 비우기", type="secondary"):
+            st.session_state.accumulated_rows = []
+            st.rerun()
 
-        if tag_041 and "$h" in tag_041:
-            mrk_041 = builder.as_mrk_041(tag_041)
-            mrk_546 = builder.as_mrk_546(tag_546)
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**041 언어코드 필드**")
-                st.code(mrk_041 or tag_041, language="text")
-            with col_b:
-                st.markdown("**546 언어주기 필드**")
-                st.code(mrk_546 or tag_546 or "(없음)", language="text")
-
-            h_code = builder.extract_lang_h(tag_041)
-            a_code = builder.lang3_from_tag041(tag_041)
-            st.info(
-                f"📖 본문 언어: **{ISDS_LANGUAGE_CODES.get(a_code or '', '?')}** (`{a_code}`)"
-                f"　　원서 언어: **{ISDS_LANGUAGE_CODES.get(h_code or '', '?')}** (`{h_code}`)"
-            )
-            if orig:
-                st.caption(f"원제: {orig}")
-
-        elif tag_041 and tag_041.startswith("📕"):
-            st.error(tag_041)
-
-        else:
-            lang_a = builder.detect_language(title)
-            if builder.is_domestic_category(category_text):
-                lang_a = "kor"
-            st.success("✅ 번역서가 아닌 것으로 판정 — 041 · 546 필드를 생성하지 않습니다.")
-            st.info(
-                f"📖 본문 언어 추정: **{ISDS_LANGUAGE_CODES.get(lang_a, '?')}** (`{lang_a}`)"
-            )
-
-        with st.expander("🧭 판정 로그 보기"):
-            st.text("\n".join(debug_lines) if debug_lines else "로그 없음")
-
-elif not fetch_btn:
-    st.info("ISBN-13을 입력하고 '도서 정보 불러오기' 버튼을 눌러주세요.")
-
-# ── 인증키 미설정 안내 ────────────────────────────────
-if not DATA4LIB_KEY:
-    st.warning(
-        "⚠️ DATA4LIB_KEY가 없어 서지정보 조회가 불가능합니다.  \n"
-        "공공데이터포털(https://www.data.go.kr) 마이페이지에서 인증키를 확인한 후 "
-        "Streamlit Secrets에 아래와 같이 등록하세요:\n\n"
-        "```toml\n[data4library]\nauth_key = \"여기에_공공데이터포털_인증키\"\n```"
+    isbn_input = st.text_input(
+        "ISBN 입력 (하이픈 포함 가능)",
+        placeholder="예: 9788936434267",
     )
+
+    col_go, _ = st.columns([1, 4])
+    with col_go:
+        lookup_clicked = st.button("서지 조회", type="primary")
+
+    if lookup_clicked:
+        if not cert_key or not cert_key.strip():
+            st.error("사이드바에 API 인증키(cert_key)를 입력해 주세요.")
+        else:
+            try:
+                with st.spinner("국립중앙도서관 API에 요청 중입니다…"):
+                    sess = requests.Session()
+                    row, warn = process_isbn_lookup(isbn_input, cert_key.strip(), api_url=api_url.strip(), session=sess)
+                if row is None:
+                    st.warning(warn or "조회 결과가 없습니다.")
+                else:
+                    if warn:
+                        st.warning(warn)
+                    st.session_state["last_row"] = row
+                    st.session_state.accumulated_rows.append(row)
+                    st.success("조회에 성공했습니다. 아래 상세를 확인하세요.")
+            except SeojiApiError as e:
+                code = e.code or ""
+                hint = ERR_CODE_MESSAGES.get(code, "")
+                st.error(f"API 오류 [{code}]: {e.message or '알 수 없는 오류'}")
+                if hint:
+                    st.caption(hint)
+            except requests.HTTPError as e:
+                st.error(f"HTTP 오류: {e}")
+            except ValueError as e:
+                st.warning(str(e))
+            except requests.RequestException as e:
+                st.error(f"네트워크 요청 중 문제가 발생했습니다: {e}")
+
+    last = st.session_state.get("last_row")
+    if last:
+        st.subheader("최근 조회 상세")
+        img_col, meta_col = st.columns([1, 2])
+        with img_col:
+            url = last.get("IMAGE_URL")
+            if url:
+                st.image(url, caption="표지", use_container_width=True)
+            else:
+                st.warning("표지 이미지 URL이 없습니다.")
+        with meta_col:
+            st.markdown(
+                f"""
+**국문 제목:** {last.get('TITLE') or '—'}  
+**원제:** {last.get('ORIGINAL_TITLE') or '—'}  
+**저자/번역자:** {last.get('AUTHOR') or '—'}  
+**출판사:** {last.get('PUBLISHER') or '—'}  
+**발행일(또는 출판예정일 등):** {last.get('REAL_PUBLISH_DATE') or '—'}  
+**ISBN:** {last.get('ISBN') or '—'}  
+"""
+            )
+            if last.get("IMAGE_URL"):
+                st.markdown(f"[표지 원본 링크]({last['IMAGE_URL']})")
+
+    st.subheader("누적 조회 목록")
+    acc = st.session_state.accumulated_rows
+    if not acc:
+        st.info("성공적으로 조회된 도서가 여기에 쌓입니다. ISBN을 조회해 보세요.")
+    else:
+        df_all = dataframe_from_rows(acc)
+        st.dataframe(df_all, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="CSV로 다운로드 (UTF-8 BOM)",
+            data=rows_to_csv_bytes(acc),
+            file_name="translation_books_bibliography.csv",
+            mime="text/csv",
+        )
+
+
+if __name__ == "__main__":
+    main()
